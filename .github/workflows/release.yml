@@ -1,0 +1,449 @@
+name: Release Automation
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+        type: string
+      release_type:
+        description: 'Type of release'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - prerelease
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  NODE_VERSION: '18'
+  JAVA_VERSION: '17'
+
+jobs:
+  # Job 1: Version validation and preparation
+  prepare-release:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            IS_PRERELEASE="${{ github.event.inputs.prerelease }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            IS_PRERELEASE="false"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if ! [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.[0-9]+)?)?$ ]]; then
+            echo "Error: Invalid version format. Expected: x.y.z or x.y.z-prerelease"
+            exit 1
+          fi
+          
+      - name: Check if version exists
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Error: Tag ${{ steps.version.outputs.tag }} already exists"
+            exit 1
+          fi
+
+  # Job 2: Run comprehensive tests
+  test-release:
+    name: Test Release Build
+    runs-on: ubuntu-latest
+    needs: prepare-release
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Run type checking
+        run: yarn type-check
+        
+      - name: Run linting
+        run: yarn lint
+        
+      - name: Run unit tests
+        run: yarn test:ci
+        
+      - name: Run security audit
+        run: yarn audit --level moderate
+
+  # Job 3: Build Android release
+  build-android-release:
+    name: Build Android Release
+    runs-on: ubuntu-latest
+    needs: [prepare-release, test-release]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Update version in package.json
+        run: |
+          npm version ${{ needs.prepare-release.outputs.version }} --no-git-tag-version
+          
+      - name: Generate Android bundle
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew bundleRelease
+          
+      - name: Generate Android APK
+        run: |
+          cd android
+          ./gradlew assembleRelease
+          
+      - name: Sign Android APK
+        if: env.ANDROID_KEYSTORE_BASE64 != ''
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/release.keystore
+          cd android
+          ./gradlew assembleRelease -Pandroid.injected.signing.store.file=release.keystore -Pandroid.injected.signing.store.password=$ANDROID_KEYSTORE_PASSWORD -Pandroid.injected.signing.key.alias=$ANDROID_KEY_ALIAS -Pandroid.injected.signing.key.password=$ANDROID_KEY_PASSWORD
+          
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-${{ needs.prepare-release.outputs.version }}
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+          retention-days: 30
+
+  # Job 4: Build iOS release (if on macOS runner)
+  build-ios-release:
+    name: Build iOS Release
+    runs-on: macos-latest
+    needs: [prepare-release, test-release]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+          
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install
+          
+      - name: Update version in package.json
+        run: |
+          npm version ${{ needs.prepare-release.outputs.version }} --no-git-tag-version
+          
+      - name: Build iOS app
+        run: |
+          cd ios
+          xcodebuild -workspace VolcanionMimir.xcworkspace -scheme VolcanionMimir -configuration Release -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14' build
+          
+      - name: Archive iOS app
+        if: env.IOS_CERTIFICATE_BASE64 != ''
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          # Setup certificates and provisioning profiles
+          echo "$IOS_CERTIFICATE_BASE64" | base64 -d > certificate.p12
+          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 -d > profile.mobileprovision
+          
+          # Install certificate
+          security create-keychain -p temp_password build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p temp_password build.keychain
+          security import certificate.p12 -k build.keychain -P "$IOS_CERTIFICATE_PASSWORD" -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k temp_password build.keychain
+          
+          # Install provisioning profile
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+          
+          # Archive
+          cd ios
+          xcodebuild -workspace VolcanionMimir.xcworkspace -scheme VolcanionMimir -configuration Release -archivePath build/VolcanionMimir.xcarchive archive
+          
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-${{ needs.prepare-release.outputs.version }}
+          path: |
+            ios/build/*.xcarchive
+          retention-days: 30
+
+  # Job 5: Generate changelog and create release
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [prepare-release, test-release, build-android-release, build-ios-release]
+    if: always() && (needs.test-release.result == 'success')
+    
+    outputs:
+      release_id: ${{ steps.create_release.outputs.id }}
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get previous tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          
+          if [ -z "$PREVIOUS_TAG" ]; then
+            CHANGELOG="## Initial Release\n\nFirst release of Volcanion Mimir e-book application."
+          else
+            # Generate changelog from commits
+            CHANGELOG="## What's Changed\n\n"
+            
+            # Get commits since last tag
+            git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..HEAD --no-merges | while read line; do
+              CHANGELOG="$CHANGELOG$line\n"
+            done
+            
+            # Add contributors
+            CONTRIBUTORS=$(git log --pretty=format:"%an" $PREVIOUS_TAG..HEAD --no-merges | sort | uniq | tr '\n' ', ' | sed 's/, $//')
+            if [ ! -z "$CONTRIBUTORS" ]; then
+              CHANGELOG="$CHANGELOG\n\n## Contributors\n\nThanks to: $CONTRIBUTORS"
+            fi
+          fi
+          
+          echo -e "$CHANGELOG" > CHANGELOG.md
+          
+          # Truncate for GitHub release body (max 125,000 characters)
+          if [ $(wc -c < CHANGELOG.md) -gt 125000 ]; then
+            head -c 124900 CHANGELOG.md > CHANGELOG_TRUNCATED.md
+            echo -e "\n\n... (truncated)" >> CHANGELOG_TRUNCATED.md
+            mv CHANGELOG_TRUNCATED.md CHANGELOG.md
+          fi
+          
+      - name: Create Git tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag -a "${{ needs.prepare-release.outputs.tag }}" -m "Release ${{ needs.prepare-release.outputs.version }}"
+          git push origin "${{ needs.prepare-release.outputs.tag }}"
+          
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          release_name: "Release ${{ needs.prepare-release.outputs.version }}"
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: ${{ needs.prepare-release.outputs.is_prerelease }}
+
+  # Job 6: Upload release assets
+  upload-assets:
+    name: Upload Release Assets
+    runs-on: ubuntu-latest
+    needs: [prepare-release, create-release, build-android-release]
+    if: always() && (needs.create-release.result == 'success')
+    
+    steps:
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: android-release-${{ needs.prepare-release.outputs.version }}
+          path: ./android-release
+          
+      - name: Upload Android APK
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./android-release/app-release.apk
+          asset_name: volcanion-mimir-${{ needs.prepare-release.outputs.version }}.apk
+          asset_content_type: application/vnd.android.package-archive
+          
+      - name: Upload Android Bundle
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./android-release/app-release.aab
+          asset_name: volcanion-mimir-${{ needs.prepare-release.outputs.version }}.aab
+          asset_content_type: application/octet-stream
+
+  # Job 7: Deploy to app stores (optional)
+  deploy-stores:
+    name: Deploy to App Stores
+    runs-on: ubuntu-latest
+    needs: [prepare-release, create-release, upload-assets]
+    if: always() && (needs.create-release.result == 'success') && !needs.prepare-release.outputs.is_prerelease
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: android-release-${{ needs.prepare-release.outputs.version }}
+          path: ./android-release
+          
+      - name: Deploy to Google Play Store
+        if: env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON != ''
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          echo "Deploying to Google Play Store..."
+          # Add your Google Play Store deployment logic here
+          # Example using fastlane:
+          # fastlane android deploy
+          
+      - name: Deploy to Apple App Store
+        if: env.APP_STORE_CONNECT_API_KEY != ''
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          echo "Deploying to Apple App Store..."
+          # Add your App Store deployment logic here
+          # Example using fastlane:
+          # fastlane ios deploy
+
+  # Job 8: Post-release notifications
+  notify:
+    name: Post-release Notifications
+    runs-on: ubuntu-latest
+    needs: [prepare-release, create-release]
+    if: always() && (needs.create-release.result == 'success')
+    
+    steps:
+      - name: Notify Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"🚀 Volcanion Mimir ${{ needs.prepare-release.outputs.version }} has been released! \nhttps://github.com/${{ github.repository }}/releases/tag/${{ needs.prepare-release.outputs.tag }}\"}" \
+            $SLACK_WEBHOOK_URL
+            
+      - name: Create deployment issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: release } = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: '${{ needs.prepare-release.outputs.tag }}'
+            });
+            
+            const issueBody = `## Deployment Checklist for ${{ needs.prepare-release.outputs.version }}
+            
+            **Release Information:**
+            - Version: ${{ needs.prepare-release.outputs.version }}
+            - Release URL: ${release.html_url}
+            - Pre-release: ${{ needs.prepare-release.outputs.is_prerelease }}
+            
+            **Deployment Tasks:**
+            - [ ] Verify Android APK installation
+            - [ ] Verify iOS app functionality (if applicable)
+            - [ ] Update documentation
+            - [ ] Update app store listings
+            - [ ] Monitor crash reports
+            - [ ] Check user feedback
+            - [ ] Verify analytics tracking
+            
+            **Rollback Plan:**
+            - Previous stable version: [Previous Tag]
+            - Rollback procedure: [Document procedure]
+            
+            Auto-created by Release Automation workflow.`;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Deployment: ${{ needs.prepare-release.outputs.version }}`,
+              body: issueBody,
+              labels: ['deployment', 'release']
+            });

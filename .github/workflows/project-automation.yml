@@ -1,0 +1,525 @@
+name: Project Automation & Labels
+
+on:
+  issues:
+    types: [opened, edited, closed, reopened]
+  pull_request:
+    types: [opened, edited, closed, reopened, ready_for_review, converted_to_draft]
+  schedule:
+    # Run weekly cleanup on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Automation action to perform'
+        required: true
+        type: choice
+        options:
+          - setup-labels
+          - cleanup-stale
+          - update-project-board
+          - maintenance-mode
+        default: 'setup-labels'
+
+jobs:
+  # Job 1: Setup and maintain labels
+  setup-labels:
+    name: Setup Project Labels
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'setup-labels' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Setup standard labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const standardLabels = [
+              // Priority labels
+              { name: 'priority/critical', color: 'B60205', description: 'Critical priority' },
+              { name: 'priority/high', color: 'D93F0B', description: 'High priority' },
+              { name: 'priority/medium', color: 'FBCA04', description: 'Medium priority' },
+              { name: 'priority/low', color: '0E8A16', description: 'Low priority' },
+              
+              // Type labels
+              { name: 'type/bug', color: 'D73A4A', description: 'Something is not working' },
+              { name: 'type/feature', color: '0075CA', description: 'New feature or request' },
+              { name: 'type/enhancement', color: 'A2EEEF', description: 'Improvement to existing feature' },
+              { name: 'type/documentation', color: '0075CA', description: 'Documentation improvement' },
+              { name: 'type/refactor', color: 'FBCA04', description: 'Code refactoring' },
+              { name: 'type/performance', color: 'F9D0C4', description: 'Performance related' },
+              
+              // Status labels
+              { name: 'status/in-progress', color: 'FBCA04', description: 'Work in progress' },
+              { name: 'status/blocked', color: 'D73A4A', description: 'Blocked by dependencies' },
+              { name: 'status/ready-for-review', color: '0E8A16', description: 'Ready for code review' },
+              { name: 'status/needs-info', color: 'D876E3', description: 'More information needed' },
+              { name: 'status/wont-fix', color: 'FFFFFF', description: 'Will not be fixed' },
+              
+              // Size labels
+              { name: 'size/XS', color: '0E8A16', description: 'Extra small change' },
+              { name: 'size/S', color: '0E8A16', description: 'Small change' },
+              { name: 'size/M', color: 'FBCA04', description: 'Medium change' },
+              { name: 'size/L', color: 'D93F0B', description: 'Large change' },
+              { name: 'size/XL', color: 'B60205', description: 'Extra large change' },
+              
+              // Platform labels
+              { name: 'platform/android', color: '3DDC84', description: 'Android specific' },
+              { name: 'platform/ios', color: '007AFF', description: 'iOS specific' },
+              { name: 'platform/both', color: '6F42C1', description: 'Both platforms' },
+              
+              // Component labels
+              { name: 'component/ui', color: 'C5DEF5', description: 'User interface' },
+              { name: 'component/api', color: 'BFD4F2', description: 'API related' },
+              { name: 'component/database', color: 'D4EDDA', description: 'Database related' },
+              { name: 'component/auth', color: 'F8D7DA', description: 'Authentication' },
+              { name: 'component/navigation', color: 'E2E3E5', description: 'Navigation' },
+              { name: 'component/storage', color: 'FFF3CD', description: 'Storage related' },
+              
+              // Special labels
+              { name: 'good first issue', color: '7057FF', description: 'Good for newcomers' },
+              { name: 'help wanted', color: '008672', description: 'Extra attention needed' },
+              { name: 'breaking-change', color: 'B60205', description: 'Breaking change' },
+              { name: 'security', color: 'D73A4A', description: 'Security related' },
+              { name: 'dependencies', color: '0366D6', description: 'Dependency updates' },
+              { name: 'automated', color: '6F42C1', description: 'Automated PR/issue' },
+              { name: 'stale', color: 'EDEDED', description: 'Stale issue/PR' },
+              
+              // Environment labels
+              { name: 'environment/development', color: '28A745', description: 'Development environment' },
+              { name: 'environment/staging', color: 'FFC107', description: 'Staging environment' },
+              { name: 'environment/production', color: 'DC3545', description: 'Production environment' },
+              
+              // Project management
+              { name: 'epic', color: '6F42C1', description: 'Epic issue' },
+              { name: 'story', color: '0075CA', description: 'User story' },
+              { name: 'task', color: 'FBCA04', description: 'Task' },
+              { name: 'subtask', color: 'C5DEF5', description: 'Subtask' },
+              
+              // CI/CD labels
+              { name: 'ci/cd', color: '2088FF', description: 'CI/CD related' },
+              { name: 'deployment', color: '0E8A16', description: 'Deployment related' },
+              { name: 'testing', color: 'F9D0C4', description: 'Testing related' },
+              
+              // Quality labels
+              { name: 'code-quality', color: 'FBCA04', description: 'Code quality improvement' },
+              { name: 'technical-debt', color: 'D93F0B', description: 'Technical debt' },
+              { name: 'maintenance', color: '0E8A16', description: 'Maintenance task' },
+              
+              // Special workflow labels
+              { name: 'dashboard', color: '6F42C1', description: 'Dashboard issue' },
+              { name: 'pinned', color: 'B60205', description: 'Pinned issue' },
+              { name: 'duplicate', color: 'CFD3D7', description: 'Duplicate issue' },
+              { name: 'invalid', color: 'E4E669', description: 'Invalid issue' }
+            ];
+            
+            for (const label of standardLabels) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label.name,
+                  color: label.color,
+                  description: label.description
+                });
+                console.log(`Created label: ${label.name}`);
+              } catch (error) {
+                if (error.status === 422) {
+                  // Label already exists, update it
+                  try {
+                    await github.rest.issues.updateLabel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      name: label.name,
+                      color: label.color,
+                      description: label.description
+                    });
+                    console.log(`Updated label: ${label.name}`);
+                  } catch (updateError) {
+                    console.log(`Failed to update label ${label.name}:`, updateError.message);
+                  }
+                } else {
+                  console.log(`Failed to create label ${label.name}:`, error.message);
+                }
+              }
+            }
+
+  # Job 2: Auto-label issues and PRs
+  auto-label:
+    name: Auto-label Issues and PRs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' || github.event_name == 'pull_request'
+    
+    steps:
+      - name: Auto-label based on content
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isIssue = context.eventName === 'issues';
+            const isPR = context.eventName === 'pull_request';
+            const item = isIssue ? context.payload.issue : context.payload.pull_request;
+            
+            const title = item.title.toLowerCase();
+            const body = (item.body || '').toLowerCase();
+            const labels = [];
+            
+            // Type-based labeling
+            if (title.includes('bug') || title.includes('fix') || body.includes('bug report')) {
+              labels.push('type/bug');
+            } else if (title.includes('feat') || title.includes('feature') || body.includes('feature request')) {
+              labels.push('type/feature');
+            } else if (title.includes('docs') || title.includes('documentation')) {
+              labels.push('type/documentation');
+            } else if (title.includes('refactor') || body.includes('refactor')) {
+              labels.push('type/refactor');
+            } else if (title.includes('perf') || title.includes('performance')) {
+              labels.push('type/performance');
+            }
+            
+            // Priority labeling based on keywords
+            if (title.includes('critical') || title.includes('urgent') || body.includes('critical')) {
+              labels.push('priority/critical');
+            } else if (title.includes('high priority') || body.includes('high priority')) {
+              labels.push('priority/high');
+            } else if (title.includes('low priority') || body.includes('low priority')) {
+              labels.push('priority/low');
+            } else {
+              labels.push('priority/medium');
+            }
+            
+            // Platform labeling
+            if (title.includes('android') || body.includes('android')) {
+              labels.push('platform/android');
+            }
+            if (title.includes('ios') || body.includes('ios')) {
+              labels.push('platform/ios');
+            }
+            if ((title.includes('android') || body.includes('android')) && 
+                (title.includes('ios') || body.includes('ios'))) {
+              labels.push('platform/both');
+            }
+            
+            // Component labeling
+            if (title.includes('ui') || title.includes('interface') || body.includes('user interface')) {
+              labels.push('component/ui');
+            }
+            if (title.includes('api') || body.includes('api')) {
+              labels.push('component/api');
+            }
+            if (title.includes('auth') || title.includes('login') || body.includes('authentication')) {
+              labels.push('component/auth');
+            }
+            if (title.includes('navigation') || body.includes('navigation')) {
+              labels.push('component/navigation');
+            }
+            if (title.includes('database') || title.includes('storage') || body.includes('database')) {
+              labels.push('component/database');
+            }
+            
+            // Security labeling
+            if (title.includes('security') || body.includes('security') || 
+                title.includes('vulnerability') || body.includes('vulnerability')) {
+              labels.push('security');
+            }
+            
+            // Special labeling for newcomers
+            if (title.includes('good first issue') || body.includes('good first issue')) {
+              labels.push('good first issue');
+            }
+            
+            // Breaking change detection
+            if (title.includes('breaking') || body.includes('breaking change') || 
+                body.includes('BREAKING CHANGE')) {
+              labels.push('breaking-change');
+            }
+            
+            // Add labels if any were determined
+            if (labels.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: item.number,
+                labels: labels
+              });
+              
+              console.log(`Added labels: ${labels.join(', ')}`);
+            }
+
+  # Job 3: Stale issue and PR management
+  stale-management:
+    name: Stale Issue Management
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'cleanup-stale' || github.event_name == 'schedule'
+    
+    steps:
+      - name: Mark stale issues and PRs
+        uses: actions/stale@v9
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          stale-issue-message: |
+            This issue has been automatically marked as stale because it has not had recent activity. 
+            It will be closed if no further activity occurs within 7 days.
+            
+            If this issue is still relevant, please:
+            - Add a comment to keep it open
+            - Add the `status/in-progress` label if work is ongoing
+            - Add the `priority/high` label if this is urgent
+            
+            Thank you for your contributions! 🙏
+          stale-pr-message: |
+            This pull request has been automatically marked as stale because it has not had recent activity.
+            It will be closed if no further activity occurs within 7 days.
+            
+            If this PR is still relevant, please:
+            - Rebase and resolve conflicts
+            - Add a comment explaining the current status
+            - Request review if ready
+            
+            Thank you for your contributions! 🙏
+          close-issue-message: |
+            This issue was automatically closed because it was marked as stale and had no activity for 7 days.
+            
+            If you believe this was closed in error, please reopen it and add a comment explaining why.
+          close-pr-message: |
+            This pull request was automatically closed because it was marked as stale and had no activity for 7 days.
+            
+            If you would like to continue with this PR, please reopen it and rebase against the latest main branch.
+          days-before-stale: 30
+          days-before-close: 7
+          stale-issue-label: 'stale'
+          stale-pr-label: 'stale'
+          exempt-issue-labels: 'priority/critical,priority/high,status/in-progress,pinned,epic'
+          exempt-pr-labels: 'status/in-progress,priority/critical,priority/high'
+          ascending: true
+          operations-per-run: 100
+
+  # Job 4: Project board automation
+  project-automation:
+    name: Project Board Automation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' || github.event_name == 'pull_request'
+    
+    steps:
+      - name: Add to project board
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isIssue = context.eventName === 'issues';
+            const isPR = context.eventName === 'pull_request';
+            const item = isIssue ? context.payload.issue : context.payload.pull_request;
+            const action = context.payload.action;
+            
+            // Only process opened items
+            if (action !== 'opened' && action !== 'reopened') {
+              return;
+            }
+            
+            const itemType = isIssue ? 'Issue' : 'Pull Request';
+            const itemNumber = item.number;
+            
+            console.log(`Processing ${itemType} #${itemNumber}: ${item.title}`);
+            
+            // Auto-assign based on labels
+            const labels = item.labels.map(label => label.name);
+            
+            // Assign to project maintainer for critical issues
+            if (labels.includes('priority/critical') || labels.includes('security')) {
+              console.log(`Critical ${itemType} detected, consider immediate attention`);
+            }
+            
+            // Auto-assign reviewers for PRs based on changed files
+            if (isPR && action === 'opened') {
+              try {
+                const { data: files } = await github.rest.pulls.listFiles({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: itemNumber,
+                });
+                
+                const reviewers = [];
+                const hasAndroidChanges = files.some(file => file.filename.includes('android/'));
+                const hasIOSChanges = files.some(file => file.filename.includes('ios/'));
+                const hasUIChanges = files.some(file => 
+                  file.filename.includes('component') || 
+                  file.filename.includes('screen') ||
+                  file.filename.includes('style')
+                );
+                
+                // Add appropriate team members as reviewers
+                // Note: Replace these with actual GitHub usernames from your team
+                if (hasAndroidChanges) {
+                  // reviewers.push('android-team-lead');
+                }
+                if (hasIOSChanges) {
+                  // reviewers.push('ios-team-lead');  
+                }
+                if (hasUIChanges) {
+                  // reviewers.push('ui-ux-lead');
+                }
+                
+                if (reviewers.length > 0) {
+                  console.log(`Would assign reviewers: ${reviewers.join(', ')}`);
+                  // Uncomment when you have actual team member usernames
+                  // await github.rest.pulls.requestReviewers({
+                  //   owner: context.repo.owner,
+                  //   repo: context.repo.repo,
+                  //   pull_number: itemNumber,
+                  //   reviewers: reviewers
+                  // });
+                }
+              } catch (error) {
+                console.log('Error processing files for reviewer assignment:', error.message);
+              }
+            }
+
+  # Job 5: Repository health check
+  repo-health:
+    name: Repository Health Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event.inputs.action == 'maintenance-mode'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Repository health analysis
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get repository statistics
+            const { data: repo } = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            
+            // Get issue and PR statistics
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+            
+            const { data: openPRs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+            
+            // Count by priority
+            const criticalIssues = openIssues.filter(issue => 
+              issue.labels.some(label => label.name === 'priority/critical')
+            ).length;
+            
+            const highPriorityIssues = openIssues.filter(issue => 
+              issue.labels.some(label => label.name === 'priority/high')
+            ).length;
+            
+            const staleItems = [...openIssues, ...openPRs].filter(item =>
+              item.labels.some(label => label.name === 'stale')
+            ).length;
+            
+            // Calculate health score
+            let healthScore = 100;
+            
+            if (criticalIssues > 5) healthScore -= 20;
+            else if (criticalIssues > 2) healthScore -= 10;
+            
+            if (highPriorityIssues > 10) healthScore -= 15;
+            else if (highPriorityIssues > 5) healthScore -= 8;
+            
+            if (staleItems > 20) healthScore -= 15;
+            else if (staleItems > 10) healthScore -= 8;
+            
+            if (openIssues.length > 50) healthScore -= 10;
+            else if (openIssues.length > 30) healthScore -= 5;
+            
+            // Create health report
+            const healthReport = `# Repository Health Report
+            
+            **Generated:** ${new Date().toISOString()}
+            **Repository:** ${repo.full_name}
+            
+            ## Statistics
+            - ⭐ Stars: ${repo.stargazers_count}
+            - 🍴 Forks: ${repo.forks_count}
+            - 👀 Watchers: ${repo.watchers_count}
+            - 📁 Size: ${repo.size} KB
+            
+            ## Issues & PRs
+            - 🐛 Open Issues: ${openIssues.length}
+            - 🔥 Critical Issues: ${criticalIssues}
+            - ⚡ High Priority Issues: ${highPriorityIssues}
+            - 🔄 Open Pull Requests: ${openPRs.length}
+            - 📦 Stale Items: ${staleItems}
+            
+            ## Health Score: ${healthScore}/100
+            
+            ${healthScore >= 90 ? '🎉 Excellent' : 
+              healthScore >= 70 ? '✅ Good' : 
+              healthScore >= 50 ? '⚠️ Fair' : '🚨 Needs Attention'}
+            
+            ## Recommendations
+            ${criticalIssues > 2 ? '- 🚨 Address critical issues immediately\n' : ''}
+            ${highPriorityIssues > 5 ? '- ⚡ Focus on high priority issues\n' : ''}
+            ${staleItems > 10 ? '- 🧹 Clean up stale issues and PRs\n' : ''}
+            ${openIssues.length > 30 ? '- 📝 Consider issue triage and prioritization\n' : ''}
+            - 📊 Regular health monitoring recommended
+            - 🏷️ Ensure proper labeling for better organization
+            - 📚 Keep documentation up to date
+            
+            ---
+            *This report was automatically generated by Repository Health Check*
+            `;
+            
+            // Update or create health dashboard
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'dashboard,health',
+              state: 'open'
+            });
+            
+            const healthIssue = issues.find(issue => 
+              issue.title.includes('Repository Health')
+            );
+            
+            if (healthIssue) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: healthIssue.number,
+                body: healthReport
+              });
+              console.log('Updated health dashboard');
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: '📊 Repository Health Dashboard',
+                body: healthReport,
+                labels: ['dashboard', 'health', 'pinned']
+              });
+              console.log('Created health dashboard');
+            }
+            
+            // Create alert if health score is low
+            if (healthScore < 70) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🚨 Repository Health Alert: Score ${healthScore}/100`,
+                body: `## Health Alert
+                
+                The repository health score has dropped to ${healthScore}/100.
+                
+                **Immediate Actions Needed:**
+                ${criticalIssues > 0 ? `- Address ${criticalIssues} critical issues\n` : ''}
+                ${highPriorityIssues > 5 ? `- Prioritize ${highPriorityIssues} high priority issues\n` : ''}
+                ${staleItems > 10 ? `- Clean up ${staleItems} stale items\n` : ''}
+                
+                Please review the health dashboard for detailed information.
+                `,
+                labels: ['health', 'alert', 'priority/high']
+              });
+            }

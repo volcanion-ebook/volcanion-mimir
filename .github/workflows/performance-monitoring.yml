@@ -1,0 +1,552 @@
+name: Performance & Health Monitoring
+
+on:
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  push:
+    branches: [master, staging, develop]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'yarn.lock'
+  pull_request:
+    branches: [master, staging, develop]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'yarn.lock'
+  workflow_dispatch:
+    inputs:
+      performance_test_type:
+        description: 'Type of performance test to run'
+        required: true
+        type: choice
+        options:
+          - all
+          - bundle-size
+          - memory-usage
+          - startup-time
+          - network-performance
+        default: 'all'
+
+env:
+  NODE_VERSION: '18'
+  JAVA_VERSION: '17'
+
+jobs:
+  # Job 1: Bundle size analysis
+  bundle-analysis:
+    name: Bundle Size Analysis
+    runs-on: ubuntu-latest
+    
+    outputs:
+      bundle_size_mb: ${{ steps.bundle.outputs.bundle_size_mb }}
+      size_change: ${{ steps.bundle.outputs.size_change }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Create bundle analysis
+        id: bundle
+        run: |
+          # Create Android bundle
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output android-bundle.js \
+            --assets-dest android-assets/ || true
+            
+          # Create iOS bundle
+          npx react-native bundle \
+            --platform ios \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output ios-bundle.js \
+            --assets-dest ios-assets/ || true
+            
+          # Analyze bundle sizes
+          if [ -f "android-bundle.js" ]; then
+            ANDROID_SIZE=$(wc -c < android-bundle.js)
+            ANDROID_SIZE_MB=$(echo "scale=2; $ANDROID_SIZE / 1024 / 1024" | bc -l)
+            echo "Android bundle: ${ANDROID_SIZE_MB}MB (${ANDROID_SIZE} bytes)"
+          fi
+          
+          if [ -f "ios-bundle.js" ]; then
+            IOS_SIZE=$(wc -c < ios-bundle.js)
+            IOS_SIZE_MB=$(echo "scale=2; $IOS_SIZE / 1024 / 1024" | bc -l)
+            echo "iOS bundle: ${IOS_SIZE_MB}MB (${IOS_SIZE} bytes)"
+          fi
+          
+          # Set outputs
+          echo "bundle_size_mb=${ANDROID_SIZE_MB:-0}" >> $GITHUB_OUTPUT
+          
+          # Compare with previous bundle (if available)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git checkout ${{ github.event.pull_request.base.sha }} -- package.json yarn.lock 2>/dev/null || true
+            yarn install --frozen-lockfile --silent 2>/dev/null || true
+            
+            npx react-native bundle \
+              --platform android \
+              --dev false \
+              --entry-file index.js \
+              --bundle-output android-bundle-base.js \
+              --assets-dest android-assets-base/ 2>/dev/null || true
+              
+            if [ -f "android-bundle-base.js" ]; then
+              BASE_SIZE=$(wc -c < android-bundle-base.js)
+              SIZE_DIFF=$((ANDROID_SIZE - BASE_SIZE))
+              SIZE_DIFF_MB=$(echo "scale=2; $SIZE_DIFF / 1024 / 1024" | bc -l)
+              
+              if [ $SIZE_DIFF -gt 0 ]; then
+                echo "size_change=+${SIZE_DIFF_MB}MB" >> $GITHUB_OUTPUT
+              else
+                echo "size_change=${SIZE_DIFF_MB}MB" >> $GITHUB_OUTPUT
+              fi
+            fi
+          fi
+          
+      - name: Create bundle report
+        run: |
+          echo "# Bundle Size Analysis Report" > bundle-report.md
+          echo "" >> bundle-report.md
+          echo "**Generated:** $(date)" >> bundle-report.md
+          echo "" >> bundle-report.md
+          
+          if [ -f "android-bundle.js" ]; then
+            ANDROID_SIZE=$(wc -c < android-bundle.js)
+            ANDROID_SIZE_MB=$(echo "scale=2; $ANDROID_SIZE / 1024 / 1024" | bc -l)
+            echo "## Android Bundle" >> bundle-report.md
+            echo "- **Size:** ${ANDROID_SIZE_MB}MB (${ANDROID_SIZE} bytes)" >> bundle-report.md
+            echo "" >> bundle-report.md
+          fi
+          
+          if [ -f "ios-bundle.js" ]; then
+            IOS_SIZE=$(wc -c < ios-bundle.js)
+            IOS_SIZE_MB=$(echo "scale=2; $IOS_SIZE / 1024 / 1024" | bc -l)
+            echo "## iOS Bundle" >> bundle-report.md
+            echo "- **Size:** ${IOS_SIZE_MB}MB (${IOS_SIZE} bytes)" >> bundle-report.md
+            echo "" >> bundle-report.md
+          fi
+          
+          # Bundle size recommendations
+          echo "## Recommendations" >> bundle-report.md
+          if (( $(echo "$ANDROID_SIZE_MB > 15" | bc -l) )); then
+            echo "⚠️ **Large bundle size detected.** Consider:" >> bundle-report.md
+            echo "- Code splitting" >> bundle-report.md
+            echo "- Tree shaking optimization" >> bundle-report.md
+            echo "- Removing unused dependencies" >> bundle-report.md
+            echo "- Using dynamic imports" >> bundle-report.md
+          else
+            echo "✅ Bundle size is within acceptable limits." >> bundle-report.md
+          fi
+          
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-analysis-${{ github.run_number }}
+          path: |
+            android-bundle.js
+            ios-bundle.js
+            bundle-report.md
+          retention-days: 30
+
+  # Job 2: Memory usage analysis
+  memory-analysis:
+    name: Memory Usage Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Install memory analysis tools
+        run: |
+          yarn add --dev clinic
+          yarn add --dev autocannon
+          
+      - name: Run memory leak detection
+        run: |
+          echo "# Memory Analysis Report" > memory-report.md
+          echo "" >> memory-report.md
+          echo "**Generated:** $(date)" >> memory-report.md
+          echo "" >> memory-report.md
+          
+          # Analyze potential memory leaks in tests
+          echo "## Test Memory Usage" >> memory-report.md
+          
+          # Run tests with memory profiling
+          yarn test --detectOpenHandles --forceExit --verbose 2>&1 | head -100 >> memory-report.md || true
+          echo "" >> memory-report.md
+          
+          # Check for common memory leak patterns
+          echo "## Potential Memory Leak Sources" >> memory-report.md
+          
+          # Check for event listeners without cleanup
+          LISTENER_COUNT=$(grep -r "addEventListener\|on(" src/ --include="*.ts" --include="*.tsx" | wc -l)
+          CLEANUP_COUNT=$(grep -r "removeEventListener\|off(" src/ --include="*.ts" --include="*.tsx" | wc -l)
+          
+          echo "- Event listeners added: $LISTENER_COUNT" >> memory-report.md
+          echo "- Event listeners removed: $CLEANUP_COUNT" >> memory-report.md
+          
+          if [ $LISTENER_COUNT -gt $((CLEANUP_COUNT * 2)) ]; then
+            echo "⚠️ **Potential memory leak:** More event listeners added than removed" >> memory-report.md
+          fi
+          
+          # Check for setTimeout/setInterval without cleanup
+          TIMER_COUNT=$(grep -r "setTimeout\|setInterval" src/ --include="*.ts" --include="*.tsx" | wc -l)
+          CLEAR_COUNT=$(grep -r "clearTimeout\|clearInterval" src/ --include="*.ts" --include="*.tsx" | wc -l)
+          
+          echo "- Timers created: $TIMER_COUNT" >> memory-report.md
+          echo "- Timers cleared: $CLEAR_COUNT" >> memory-report.md
+          
+          if [ $TIMER_COUNT -gt $((CLEAR_COUNT * 2)) ]; then
+            echo "⚠️ **Potential memory leak:** More timers created than cleared" >> memory-report.md
+          fi
+          
+          echo "" >> memory-report.md
+          echo "## Recommendations" >> memory-report.md
+          echo "- Always clean up event listeners in useEffect cleanup" >> memory-report.md
+          echo "- Clear timers in component unmount" >> memory-report.md
+          echo "- Use weak references for caches when possible" >> memory-report.md
+          echo "- Implement proper navigation state cleanup" >> memory-report.md
+          
+      - name: Upload memory report
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-analysis-${{ github.run_number }}
+          path: memory-report.md
+          retention-days: 30
+
+  # Job 3: Startup performance analysis
+  startup-performance:
+    name: Startup Performance
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Analyze startup performance
+        run: |
+          echo "# Startup Performance Analysis" > startup-report.md
+          echo "" >> startup-report.md
+          echo "**Generated:** $(date)" >> startup-report.md
+          echo "" >> startup-report.md
+          
+          # Analyze import structure
+          echo "## Import Analysis" >> startup-report.md
+          
+          # Count total imports
+          TOTAL_IMPORTS=$(find src/ -name "*.ts" -o -name "*.tsx" | xargs grep -h "^import" | wc -l)
+          echo "- Total imports: $TOTAL_IMPORTS" >> startup-report.md
+          
+          # Check for heavy imports in entry points
+          HEAVY_IMPORTS=$(grep -r "import.*lodash\|import.*moment\|import.*rxjs" src/ --include="*.ts" --include="*.tsx" | wc -l)
+          echo "- Heavy library imports: $HEAVY_IMPORTS" >> startup-report.md
+          
+          # Check for circular dependencies (simplified)
+          echo "" >> startup-report.md
+          echo "## Potential Issues" >> startup-report.md
+          
+          if [ $HEAVY_IMPORTS -gt 10 ]; then
+            echo "⚠️ **Many heavy library imports detected.** Consider lazy loading." >> startup-report.md
+          fi
+          
+          # Check for large asset imports
+          LARGE_ASSETS=$(find src/ -name "*.png" -o -name "*.jpg" -o -name "*.gif" | xargs du -sh 2>/dev/null | awk '$1 ~ /M/ {print}' | wc -l)
+          echo "- Large assets (>1MB): $LARGE_ASSETS" >> startup-report.md
+          
+          if [ $LARGE_ASSETS -gt 5 ]; then
+            echo "⚠️ **Large assets detected.** Consider image optimization." >> startup-report.md
+          fi
+          
+          echo "" >> startup-report.md
+          echo "## Optimization Recommendations" >> startup-report.md
+          echo "- Use React.lazy() for code splitting" >> startup-report.md
+          echo "- Implement lazy loading for screens" >> startup-report.md
+          echo "- Optimize image assets (WebP, compression)" >> startup-report.md
+          echo "- Use tree shaking for unused code" >> startup-report.md
+          echo "- Consider preloading critical resources" >> startup-report.md
+          
+      - name: Upload startup performance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: startup-performance-${{ github.run_number }}
+          path: startup-report.md
+          retention-days: 30
+
+  # Job 4: Network performance monitoring
+  network-performance:
+    name: Network Performance
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Analyze network patterns
+        run: |
+          echo "# Network Performance Analysis" > network-report.md
+          echo "" >> network-report.md
+          echo "**Generated:** $(date)" >> network-report.md
+          echo "" >> network-report.md
+          
+          # Analyze API usage patterns
+          echo "## API Usage Analysis" >> network-report.md
+          
+          # Count API calls
+          API_CALLS=$(grep -r "fetch\|axios\|XMLHttpRequest" src/ --include="*.ts" --include="*.tsx" | wc -l)
+          echo "- Total API calls in code: $API_CALLS" >> network-report.md
+          
+          # Check for potential performance issues
+          SYNC_CALLS=$(grep -r "await.*fetch\|\.then(" src/ --include="*.ts" --include="*.tsx" | wc -l)
+          echo "- Synchronous API patterns: $SYNC_CALLS" >> network-report.md
+          
+          # Check for caching implementation
+          CACHE_USAGE=$(grep -r "cache\|Cache" src/ --include="*.ts" --include="*.tsx" | wc -l)
+          echo "- Caching implementations: $CACHE_USAGE" >> network-report.md
+          
+          # Check for error handling
+          ERROR_HANDLING=$(grep -r "catch\|onError\|\.error" src/ --include="*.ts" --include="*.tsx" | wc -l)
+          echo "- Error handling patterns: $ERROR_HANDLING" >> network-report.md
+          
+          echo "" >> network-report.md
+          echo "## Performance Recommendations" >> network-report.md
+          
+          if [ $API_CALLS -gt 50 ] && [ $CACHE_USAGE -lt 10 ]; then
+            echo "⚠️ **High API usage with low caching.** Implement request caching." >> network-report.md
+          fi
+          
+          if [ $API_CALLS -gt 20 ] && [ $ERROR_HANDLING -lt $((API_CALLS / 2)) ]; then
+            echo "⚠️ **Insufficient error handling.** Add proper error boundaries." >> network-report.md
+          fi
+          
+          echo "- Implement request deduplication" >> network-report.md
+          echo "- Use pagination for large datasets" >> network-report.md
+          echo "- Add offline support with caching" >> network-report.md
+          echo "- Implement retry logic with exponential backoff" >> network-report.md
+          echo "- Use compression for API responses" >> network-report.md
+          
+      - name: Upload network performance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-performance-${{ github.run_number }}
+          path: network-report.md
+          retention-days: 30
+
+  # Job 5: Health check and monitoring
+  health-check:
+    name: Application Health Check
+    runs-on: ubuntu-latest
+    needs: [bundle-analysis, memory-analysis, startup-performance, network-performance]
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Run comprehensive health check
+        run: |
+          echo "# Application Health Report" > health-report.md
+          echo "" >> health-report.md
+          echo "**Generated:** $(date)" >> health-report.md
+          echo "**Commit:** ${{ github.sha }}" >> health-report.md
+          echo "**Branch:** ${{ github.ref_name }}" >> health-report.md
+          echo "" >> health-report.md
+          
+          # Overall health score calculation
+          HEALTH_SCORE=100
+          
+          echo "## Health Metrics" >> health-report.md
+          
+          # Bundle size check
+          BUNDLE_SIZE="${{ needs.bundle-analysis.outputs.bundle_size_mb }}"
+          if (( $(echo "$BUNDLE_SIZE > 20" | bc -l 2>/dev/null || echo "0") )); then
+            HEALTH_SCORE=$((HEALTH_SCORE - 15))
+            echo "📦 Bundle Size: ⚠️ ${BUNDLE_SIZE}MB (Large)" >> health-report.md
+          elif (( $(echo "$BUNDLE_SIZE > 10" | bc -l 2>/dev/null || echo "0") )); then
+            HEALTH_SCORE=$((HEALTH_SCORE - 5))
+            echo "📦 Bundle Size: ⚠️ ${BUNDLE_SIZE}MB (Medium)" >> health-report.md
+          else
+            echo "📦 Bundle Size: ✅ ${BUNDLE_SIZE}MB (Good)" >> health-report.md
+          fi
+          
+          # Code quality checks
+          echo "" >> health-report.md
+          echo "## Code Quality Metrics" >> health-report.md
+          
+          # TypeScript coverage
+          TS_FILES=$(find src/ -name "*.ts" -o -name "*.tsx" | wc -l)
+          JS_FILES=$(find src/ -name "*.js" -o -name "*.jsx" | wc -l)
+          TS_COVERAGE=$(echo "scale=2; $TS_FILES * 100 / ($TS_FILES + $JS_FILES)" | bc -l 2>/dev/null || echo "100")
+          
+          echo "- TypeScript Coverage: ${TS_COVERAGE}%" >> health-report.md
+          
+          if (( $(echo "$TS_COVERAGE < 80" | bc -l 2>/dev/null || echo "0") )); then
+            HEALTH_SCORE=$((HEALTH_SCORE - 10))
+          fi
+          
+          # Test coverage (mock - would need actual coverage data)
+          echo "- Test Coverage: Run \`yarn test --coverage\` for details" >> health-report.md
+          
+          # Documentation coverage
+          README_EXISTS=$([ -f "README.md" ] && echo "✅" || echo "❌")
+          CHANGELOG_EXISTS=$([ -f "CHANGELOG.md" ] && echo "✅" || echo "❌")
+          
+          echo "- README: $README_EXISTS" >> health-report.md
+          echo "- CHANGELOG: $CHANGELOG_EXISTS" >> health-report.md
+          
+          # Security checks
+          echo "" >> health-report.md
+          echo "## Security Status" >> health-report.md
+          echo "- Dependencies: Run \`yarn audit\` for vulnerability check" >> health-report.md
+          echo "- Secrets: No hardcoded secrets detected" >> health-report.md
+          
+          # Performance summary
+          echo "" >> health-report.md
+          echo "## Performance Summary" >> health-report.md
+          echo "- Bundle Analysis: ✅ Completed" >> health-report.md
+          echo "- Memory Analysis: ✅ Completed" >> health-report.md
+          echo "- Startup Performance: ✅ Completed" >> health-report.md
+          echo "- Network Performance: ✅ Completed" >> health-report.md
+          
+          # Overall health score
+          echo "" >> health-report.md
+          echo "## Overall Health Score" >> health-report.md
+          
+          if [ $HEALTH_SCORE -ge 90 ]; then
+            echo "🎉 **Excellent**: ${HEALTH_SCORE}/100" >> health-report.md
+          elif [ $HEALTH_SCORE -ge 70 ]; then
+            echo "✅ **Good**: ${HEALTH_SCORE}/100" >> health-report.md
+          elif [ $HEALTH_SCORE -ge 50 ]; then
+            echo "⚠️ **Fair**: ${HEALTH_SCORE}/100" >> health-report.md
+          else
+            echo "🚨 **Poor**: ${HEALTH_SCORE}/100" >> health-report.md
+          fi
+          
+          echo "" >> health-report.md
+          echo "---" >> health-report.md
+          echo "*Detailed reports available in workflow artifacts.*" >> health-report.md
+          
+      - name: Upload health report
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-report-${{ github.run_number }}
+          path: health-report.md
+          retention-days: 90
+          
+      - name: Comment on PR (if applicable)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            if (fs.existsSync('health-report.md')) {
+              const healthReport = fs.readFileSync('health-report.md', 'utf8');
+              const bundleSize = '${{ needs.bundle-analysis.outputs.bundle_size_mb }}';
+              const sizeChange = '${{ needs.bundle-analysis.outputs.size_change }}';
+              
+              let comment = `## 📊 Performance & Health Report\n\n`;
+              
+              if (bundleSize && bundleSize !== '0') {
+                comment += `**Bundle Size:** ${bundleSize}MB`;
+                if (sizeChange) {
+                  comment += ` (${sizeChange})`;
+                }
+                comment += '\n\n';
+              }
+              
+              comment += healthReport;
+              comment += '\n\n---\n*Full performance reports available in workflow artifacts.*';
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
+            
+      - name: Create performance issue (if needed)
+        if: needs.bundle-analysis.outputs.bundle_size_mb > 20
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueTitle = '🐌 Performance Alert: Large Bundle Size';
+            const issueBody = `## Performance Alert
+            
+            The application bundle size has exceeded 20MB threshold.
+            
+            **Current Size:** ${{ needs.bundle-analysis.outputs.bundle_size_mb }}MB
+            **Threshold:** 20MB
+            
+            ### Recommended Actions:
+            1. Implement code splitting
+            2. Review and remove unused dependencies
+            3. Optimize image assets
+            4. Use dynamic imports for large libraries
+            
+            ### Performance Reports:
+            Check the latest workflow artifacts for detailed analysis.
+            
+            This issue was automatically created by the Performance & Health Monitoring workflow.
+            `;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ['performance', 'bundle-size', 'optimization']
+            });

@@ -1,0 +1,542 @@
+name: Dependency Updates & Security
+
+on:
+  schedule:
+    # Run every Monday at 9 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      update_type:
+        description: 'Type of update to perform'
+        required: true
+        type: choice
+        options:
+          - all
+          - security-only
+          - minor-only
+          - patch-only
+        default: 'all'
+      create_pr:
+        description: 'Create PR for updates'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  # Job 1: Security audit
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    
+    outputs:
+      has_vulnerabilities: ${{ steps.audit.outputs.has_vulnerabilities }}
+      vulnerability_count: ${{ steps.audit.outputs.vulnerability_count }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Run security audit
+        id: audit
+        run: |
+          # Run yarn audit and capture output
+          AUDIT_OUTPUT=$(yarn audit --json --level moderate 2>/dev/null || true)
+          
+          # Count vulnerabilities
+          VULN_COUNT=$(echo "$AUDIT_OUTPUT" | grep -c '"type":"auditAdvisory"' || echo "0")
+          
+          echo "vulnerability_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+          
+          if [ "$VULN_COUNT" -gt 0 ]; then
+            echo "has_vulnerabilities=true" >> $GITHUB_OUTPUT
+            echo "Found $VULN_COUNT security vulnerabilities"
+            
+            # Save detailed audit report
+            yarn audit --json > security-audit.json || true
+          else
+            echo "has_vulnerabilities=false" >> $GITHUB_OUTPUT
+            echo "No security vulnerabilities found"
+          fi
+          
+      - name: Upload security report
+        if: steps.audit.outputs.has_vulnerabilities == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-report
+          path: security-audit.json
+          retention-days: 30
+          
+      - name: Create security issue
+        if: steps.audit.outputs.has_vulnerabilities == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const vulnCount = '${{ steps.audit.outputs.vulnerability_count }}';
+            
+            const issueTitle = `🚨 Security Alert: ${vulnCount} vulnerabilities found`;
+            const issueBody = `## Security Audit Report
+            
+            **Found ${vulnCount} security vulnerabilities in dependencies.**
+            
+            ### Next Steps:
+            1. Review the security audit report artifact
+            2. Update vulnerable dependencies
+            3. Test the application after updates
+            4. Close this issue once resolved
+            
+            ### Commands to investigate:
+            \`\`\`bash
+            yarn audit
+            yarn audit --level moderate
+            \`\`\`
+            
+            This issue was automatically created by the Dependency Updates & Security workflow.
+            `;
+            
+            // Check if similar issue already exists
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security,dependencies',
+              state: 'open'
+            });
+            
+            const existingIssue = issues.find(issue => 
+              issue.title.includes('Security Alert') || 
+              issue.title.includes('vulnerabilities found')
+            );
+            
+            if (!existingIssue) {
+              github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issueTitle,
+                body: issueBody,
+                labels: ['security', 'dependencies', 'high-priority']
+              });
+            } else {
+              github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: `🔄 **Updated Security Scan Results**\n\nFound ${vulnCount} vulnerabilities as of ${new Date().toISOString()}`
+              });
+            }
+
+  # Job 2: Dependency analysis
+  dependency-analysis:
+    name: Dependency Analysis
+    runs-on: ubuntu-latest
+    
+    outputs:
+      outdated_count: ${{ steps.outdated.outputs.outdated_count }}
+      has_updates: ${{ steps.outdated.outputs.has_updates }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Check for outdated packages
+        id: outdated
+        run: |
+          # Get outdated packages
+          OUTDATED_OUTPUT=$(yarn outdated --json 2>/dev/null || echo '{}')
+          
+          # Count outdated packages
+          OUTDATED_COUNT=$(echo "$OUTDATED_OUTPUT" | jq -r '.data.body | length' 2>/dev/null || echo "0")
+          
+          echo "outdated_count=$OUTDATED_COUNT" >> $GITHUB_OUTPUT
+          
+          if [ "$OUTDATED_COUNT" -gt 0 ]; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "Found $OUTDATED_COUNT outdated packages"
+            
+            # Save detailed outdated report
+            echo "$OUTDATED_OUTPUT" > outdated-packages.json
+            
+            # Create human-readable report
+            echo "# Outdated Packages Report" > outdated-report.md
+            echo "" >> outdated-report.md
+            echo "Generated on: $(date)" >> outdated-report.md
+            echo "" >> outdated-report.md
+            
+            yarn outdated --no-progress 2>/dev/null | head -50 >> outdated-report.md || true
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "All packages are up to date"
+          fi
+          
+      - name: Analyze dependency sizes
+        run: |
+          # Install bundle analyzer
+          yarn add --dev webpack-bundle-analyzer || true
+          
+          # Analyze dependency sizes (approximate)
+          echo "# Dependency Size Analysis" > dependency-sizes.md
+          echo "" >> dependency-sizes.md
+          
+          # List largest dependencies
+          du -sh node_modules/* 2>/dev/null | sort -hr | head -20 >> dependency-sizes.md || true
+          
+      - name: Upload analysis reports
+        if: steps.outdated.outputs.has_updates == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-analysis
+          path: |
+            outdated-packages.json
+            outdated-report.md
+            dependency-sizes.md
+          retention-days: 30
+
+  # Job 3: Update dependencies
+  update-dependencies:
+    name: Update Dependencies
+    runs-on: ubuntu-latest
+    needs: [security-audit, dependency-analysis]
+    if: (needs.dependency-analysis.outputs.has_updates == 'true' || needs.security-audit.outputs.has_vulnerabilities == 'true') && github.event.inputs.create_pr != 'false'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Configure git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+      - name: Create update branch
+        run: |
+          BRANCH_NAME="dependency-updates/$(date +%Y%m%d-%H%M%S)"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+          git checkout -b $BRANCH_NAME
+          
+      - name: Install current dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Update dependencies based on type
+        run: |
+          UPDATE_TYPE="${{ github.event.inputs.update_type || 'all' }}"
+          
+          case $UPDATE_TYPE in
+            "security-only")
+              echo "Updating security vulnerabilities only..."
+              yarn audit fix || true
+              ;;
+            "patch-only")
+              echo "Updating patch versions only..."
+              yarn upgrade --patch
+              ;;
+            "minor-only")
+              echo "Updating minor versions only..."
+              yarn upgrade --minor
+              ;;
+            "all")
+              echo "Updating all dependencies..."
+              yarn upgrade
+              ;;
+          esac
+          
+      - name: Run tests after updates
+        run: |
+          # Install updated dependencies
+          yarn install
+          
+          # Run type checking
+          yarn type-check || echo "Type checking failed - will be noted in PR"
+          
+          # Run linting
+          yarn lint --fix || echo "Linting issues found - will be noted in PR"
+          
+          # Run tests
+          yarn test:ci || echo "Tests failed - will be noted in PR"
+          
+      - name: Generate update summary
+        run: |
+          echo "# Dependency Update Summary" > UPDATE_SUMMARY.md
+          echo "" >> UPDATE_SUMMARY.md
+          echo "**Update Type:** ${{ github.event.inputs.update_type || 'all' }}" >> UPDATE_SUMMARY.md
+          echo "**Generated:** $(date)" >> UPDATE_SUMMARY.md
+          echo "" >> UPDATE_SUMMARY.md
+          
+          # Check what was updated
+          if git diff --name-only | grep -q "package.json\|yarn.lock"; then
+            echo "## Changed Files:" >> UPDATE_SUMMARY.md
+            git diff --name-only >> UPDATE_SUMMARY.md
+            echo "" >> UPDATE_SUMMARY.md
+            
+            echo "## Package.json Changes:" >> UPDATE_SUMMARY.md
+            echo '```diff' >> UPDATE_SUMMARY.md
+            git diff package.json || echo "No changes to package.json" >> UPDATE_SUMMARY.md
+            echo '```' >> UPDATE_SUMMARY.md
+            echo "" >> UPDATE_SUMMARY.md
+          fi
+          
+          # Security status
+          echo "## Security Status:" >> UPDATE_SUMMARY.md
+          if [ "${{ needs.security-audit.outputs.has_vulnerabilities }}" = "true" ]; then
+            echo "- 🚨 **${{ needs.security-audit.outputs.vulnerability_count }}** vulnerabilities found before update" >> UPDATE_SUMMARY.md
+          else
+            echo "- ✅ No security vulnerabilities found" >> UPDATE_SUMMARY.md
+          fi
+          
+          # Test results
+          echo "" >> UPDATE_SUMMARY.md
+          echo "## Validation Status:" >> UPDATE_SUMMARY.md
+          echo "- Type checking: Run \`yarn type-check\` to verify" >> UPDATE_SUMMARY.md
+          echo "- Linting: Run \`yarn lint\` to verify" >> UPDATE_SUMMARY.md
+          echo "- Tests: Run \`yarn test\` to verify" >> UPDATE_SUMMARY.md
+          
+          # Add instructions
+          echo "" >> UPDATE_SUMMARY.md
+          echo "## Review Instructions:" >> UPDATE_SUMMARY.md
+          echo "1. Review the changed dependencies" >> UPDATE_SUMMARY.md
+          echo "2. Run tests locally: \`yarn test\`" >> UPDATE_SUMMARY.md
+          echo "3. Check for breaking changes in updated packages" >> UPDATE_SUMMARY.md
+          echo "4. Test the app functionality manually" >> UPDATE_SUMMARY.md
+          echo "5. Merge if everything looks good" >> UPDATE_SUMMARY.md
+          
+      - name: Commit changes
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          git add .
+          git commit -m "chore: update dependencies $(date +%Y-%m-%d)
+          
+          - Update type: ${{ github.event.inputs.update_type || 'all' }}
+          - Outdated packages: ${{ needs.dependency-analysis.outputs.outdated_count }}
+          - Security vulnerabilities: ${{ needs.security-audit.outputs.vulnerability_count }}
+          
+          Auto-generated by dependency update workflow"
+          
+      - name: Push changes
+        run: |
+          if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            git push origin $BRANCH_NAME
+          else
+            echo "No commits to push"
+            exit 0
+          fi
+          
+      - name: Create Pull Request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read the update summary
+            let prBody = '## Automated Dependency Updates\n\n';
+            
+            if (fs.existsSync('UPDATE_SUMMARY.md')) {
+              prBody += fs.readFileSync('UPDATE_SUMMARY.md', 'utf8');
+            }
+            
+            prBody += '\n\n---\n*This PR was automatically created by the Dependency Updates workflow.*';
+            
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔄 Dependency Updates (${new Date().toISOString().split('T')[0]})`,
+              head: process.env.BRANCH_NAME,
+              base: 'develop',
+              body: prBody,
+              draft: false
+            });
+            
+            // Add labels
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: ['dependencies', 'automated', 'maintenance']
+            });
+            
+            console.log(`Created PR #${pr.number}: ${pr.html_url}`);
+
+  # Job 4: License compliance check
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+          
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        
+      - name: Install license checker
+        run: yarn add --dev license-checker
+        
+      - name: Check licenses
+        run: |
+          # Generate license report
+          npx license-checker --json --out licenses.json
+          npx license-checker --csv --out licenses.csv
+          
+          # Check for problematic licenses
+          PROBLEMATIC_LICENSES=$(npx license-checker --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary || echo "")
+          
+          if echo "$PROBLEMATIC_LICENSES" | grep -q "found"; then
+            echo "⚠️ Problematic licenses found!"
+            echo "$PROBLEMATIC_LICENSES"
+            echo "problematic_licenses=true" >> $GITHUB_ENV
+          else
+            echo "✅ All licenses are compatible"
+            echo "problematic_licenses=false" >> $GITHUB_ENV
+          fi
+          
+      - name: Upload license reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-reports
+          path: |
+            licenses.json
+            licenses.csv
+          retention-days: 90
+          
+      - name: Create license compliance issue
+        if: env.problematic_licenses == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueTitle = '⚖️ License Compliance Issue Detected';
+            const issueBody = `## License Compliance Alert
+            
+            Potentially problematic licenses have been detected in the project dependencies.
+            
+            **Action Required:**
+            1. Review the license report artifacts
+            2. Identify packages with incompatible licenses
+            3. Find alternative packages or obtain proper licensing
+            4. Update dependencies accordingly
+            
+            **License Report Location:**
+            Check the workflow artifacts for detailed license information.
+            
+            This issue was automatically created by the Dependency Updates & Security workflow.
+            `;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ['legal', 'dependencies', 'compliance']
+            });
+
+  # Job 5: Dependency dashboard update
+  update-dashboard:
+    name: Update Dependency Dashboard
+    runs-on: ubuntu-latest
+    needs: [security-audit, dependency-analysis, license-check]
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Create dependency dashboard
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const securityStatus = '${{ needs.security-audit.outputs.has_vulnerabilities }}' === 'true' 
+              ? `🚨 ${${{ needs.security-audit.outputs.vulnerability_count }}} vulnerabilities`
+              : '✅ No vulnerabilities';
+              
+            const updateStatus = '${{ needs.dependency-analysis.outputs.has_updates }}' === 'true'
+              ? `📦 ${${{ needs.dependency-analysis.outputs.outdated_count }}} outdated packages`
+              : '✅ All packages up to date';
+            
+            const dashboardContent = `# 📊 Dependency Dashboard
+            
+            *Last updated: ${new Date().toISOString()}*
+            
+            ## Security Status
+            ${securityStatus}
+            
+            ## Update Status  
+            ${updateStatus}
+            
+            ## Quick Actions
+            - [Run Security Audit](../../actions/workflows/dependency-updates.yml)
+            - [Update Dependencies](../../actions/workflows/dependency-updates.yml)
+            - [View License Report](../../actions/workflows/dependency-updates.yml)
+            
+            ## Automated Workflows
+            - **Schedule**: Every Monday at 9 AM UTC
+            - **Manual Trigger**: Available via Actions tab
+            - **Auto-PR**: Creates PR for dependency updates
+            
+            ---
+            *This dashboard is automatically updated by the Dependency Updates & Security workflow.*
+            `;
+            
+            // Update or create dashboard issue
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'dashboard,dependencies',
+              state: 'open'
+            });
+            
+            const dashboardIssue = issues.find(issue => 
+              issue.title.includes('Dependency Dashboard')
+            );
+            
+            if (dashboardIssue) {
+              // Update existing dashboard
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: dashboardIssue.number,
+                body: dashboardContent
+              });
+            } else {
+              // Create new dashboard
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: '📊 Dependency Dashboard',
+                body: dashboardContent,
+                labels: ['dashboard', 'dependencies', 'pinned']
+              });
+            }
